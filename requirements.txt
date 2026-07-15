@@ -1,0 +1,4 @@
+fastapi>=0.110.0
+uvicorn>=0.28.0
+yt-dlp>=2024.04.09
+starlette>=0.37.2
