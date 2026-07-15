@@ -49,12 +49,6 @@ COMMON_YDL_OPTS = {
     "noplaylist": True,
     "nocheckcertificate": True,
     "ignoreerrors": False,
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["android", "ios", "mweb", "tv"],
-            "player_skip": ["js", "configs", "webpage"],
-        }
-    },
     "http_headers": {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -62,6 +56,52 @@ COMMON_YDL_OPTS = {
         "Sec-Fetch-Mode": "navigate",
     },
 }
+
+YTDLP_CLIENT_FALLBACKS = [
+    ["ios"],
+    ["android_vr"],
+    ["tv_embedded"],
+    ["web_safari"],
+    ["web_creator"],
+    ["android", "ios", "mweb", "tv"],
+]
+
+
+def extract_with_fallback(url: str, base_opts: dict, download: bool = False):
+    is_youtube = "youtube.com" in url or "youtu.be" in url
+
+    if not is_youtube:
+        with yt_dlp.YoutubeDL(base_opts) as ydl:
+            res = ydl.extract_info(url, download=download)
+            filename = ydl.prepare_filename(res) if download and res else None
+            return res, filename, ydl
+
+    last_err = None
+    for clients in YTDLP_CLIENT_FALLBACKS:
+        try:
+            opts = dict(base_opts)
+            opts["extractor_args"] = {
+                "youtube": {
+                    "player_client": clients,
+                    "player_skip": ["js", "configs", "webpage"],
+                }
+            }
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                res = ydl.extract_info(url, download=download)
+                if res:
+                    filename = ydl.prepare_filename(res) if download else None
+                    return res, filename, ydl
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            if "confirm you" in err_str or "bot" in err_str.lower() or "HTTP Error 429" in err_str:
+                continue
+            raise e
+
+    if last_err:
+        raise last_err
+    raise RuntimeError("Failed to extract YouTube info")
+
 
 
 def _human_size(num_bytes):
@@ -91,8 +131,7 @@ def list_formats(url: str):
     }
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info, _, _ = extract_with_fallback(url, ydl_opts, download=False)
     except yt_dlp.utils.DownloadError as e:
         log.warning("Probe error for %s: %s", url, e)
         raise HTTPException(status_code=400, detail=f"Couldn't read this link: {e}")
@@ -180,22 +219,18 @@ def download(url: str, format_id: str, kind: str = None):
     }
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            result = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(result)
+        result, filename, ydl = extract_with_fallback(url, ydl_opts, download=True)
     except yt_dlp.utils.DownloadError as e:
         log.warning("Download failed for %s (%s): %s", url, format_id, e)
         # Try a ultimate fallback if requested format failed
         try:
             ydl_opts["format"] = "bestvideo+bestaudio/best"
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                result = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(result)
+            result, filename, ydl = extract_with_fallback(url, ydl_opts, download=True)
         except Exception as e2:
             raise HTTPException(status_code=400, detail=f"Download failed: {e2}")
-    except Exception:
+    except Exception as e:
         log.exception("Unexpected error downloading %s (%s)", url, format_id)
-        raise HTTPException(status_code=500, detail="Something went wrong during download.")
+        raise HTTPException(status_code=500, detail=f"Something went wrong during download: {e}")
 
     # If ffmpeg merged streams, the final file may have a different extension.
     if ydl_opts.get("merge_output_format"):
