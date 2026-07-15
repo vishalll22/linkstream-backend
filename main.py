@@ -43,6 +43,20 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 # Safety limits — tune for your deployment.
 MAX_DURATION_SECONDS = 60 * 60 * 3  # 3 hours
 
+COMMON_YDL_OPTS = {
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "nocheckcertificate": True,
+    "ignoreerrors": False,
+    "http_headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Mode": "navigate",
+    },
+}
+
 
 def _human_size(num_bytes):
     if not num_bytes:
@@ -66,16 +80,15 @@ def list_formats(url: str):
         raise HTTPException(status_code=400, detail="That doesn't look like a valid link.")
 
     ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
+        **COMMON_YDL_OPTS,
         "skip_download": True,
-        "noplaylist": True,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as e:
+        log.warning("Probe error for %s: %s", url, e)
         raise HTTPException(status_code=400, detail=f"Couldn't read this link: {e}")
     except Exception as e:
         log.exception("Unexpected error probing %s", url)
@@ -135,36 +148,26 @@ def list_formats(url: str):
 
 
 @app.get("/api/download")
-def download(url: str, format_id: str):
+def download(url: str, format_id: str, kind: str = None):
     """Download the chosen format (merging audio if needed) and return the file."""
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="That doesn't look like a valid link.")
 
-    # Probe again to find out whether the chosen format already includes audio.
-    probe_opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
-    try:
-        with yt_dlp.YoutubeDL(probe_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(status_code=400, detail=f"Couldn't read this link: {e}")
-
-    chosen = next((f for f in info.get("formats", []) if f["format_id"] == format_id), None)
-    if chosen is None:
-        raise HTTPException(status_code=404, detail="That format is no longer available — try analyzing the link again.")
-
-    if chosen.get("vcodec") != "none" and chosen.get("acodec") == "none":
-        # Video-only stream: merge with the best available audio.
-        format_selector = f"{format_id}+bestaudio/best"
+    # Use yt-dlp fallback slash syntax so it never throws a 404/DownloadError on dynamic format rotation
+    if kind == "video-only":
+        format_selector = f"{format_id}+bestaudio/best/{format_id}"
+    elif kind == "audio":
+        format_selector = f"{format_id}/bestaudio/best"
+    elif kind == "video":
+        format_selector = f"{format_id}/bestvideo+bestaudio/best"
     else:
-        format_selector = format_id
+        format_selector = f"{format_id}+bestaudio/{format_id}/best"
 
     job_id = uuid.uuid4().hex
     outtmpl = str(DOWNLOAD_DIR / f"{job_id}.%(ext)s")
 
     ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
+        **COMMON_YDL_OPTS,
         "format": format_selector,
         "outtmpl": outtmpl,
         "merge_output_format": "mp4",
@@ -175,7 +178,15 @@ def download(url: str, format_id: str):
             result = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(result)
     except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(status_code=400, detail=f"Download failed: {e}")
+        log.warning("Download failed for %s (%s): %s", url, format_id, e)
+        # Try a ultimate fallback if requested format failed
+        try:
+            ydl_opts["format"] = "bestvideo+bestaudio/best"
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                result = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(result)
+        except Exception as e2:
+            raise HTTPException(status_code=400, detail=f"Download failed: {e2}")
     except Exception:
         log.exception("Unexpected error downloading %s (%s)", url, format_id)
         raise HTTPException(status_code=500, detail="Something went wrong during download.")
